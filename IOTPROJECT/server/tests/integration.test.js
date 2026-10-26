@@ -1,0 +1,122 @@
+import test,{before,after} from 'node:test';
+import assert from 'node:assert/strict';
+import {randomUUID} from 'node:crypto';
+import request from 'supertest';
+import pg from 'pg';
+import {DateTime} from 'luxon';
+import {readConfig} from '../config.js';
+import {createPool} from '../db.js';
+import {migrate} from '../migrate.js';
+import {createApp} from '../app.js';
+const cfg=readConfig();
+if(cfg.production)throw new Error('Do not run integration tests against production.');
+const schema='smartmed_test_'+randomUUID().replaceAll('-','');
+let admin,pool,app;
+const origin='http://localhost:5173';
+const password='Test-only-long-password-8264';
+async function signup(label){
+  const agent=request.agent(app);const s=await agent.get('/api/v1/auth/session').expect(200);
+  const response=await agent.post('/api/v1/auth/register').set('Origin',origin).set('X-CSRF-Token',s.body.csrfToken).send({email:label.toLowerCase().replaceAll(' ','-')+'-'+randomUUID()+'@example.test',password,displayName:label,timezone:'Asia/Kolkata'}).expect(201);
+  return {agent,csrf:response.body.csrfToken,user:response.body.user};
+}
+function write(account,method,path,body){const r=account.agent[method]('/api/v1'+path).set('Origin',origin).set('X-CSRF-Token',account.csrf);return body===undefined?r:r.send(body);}
+const med=(overrides={})=>({name:'Test prescription',strength:'5 mg',quantity:'1 tablet',instructions:'As prescribed',slotId:'morning',reminderTime:'08:00',...overrides});
+before(async()=>{
+  admin=createPool(cfg.DATABASE_URL);await admin.query(`CREATE SCHEMA ${schema}`);
+  pool=new pg.Pool({connectionString:cfg.DATABASE_URL,options:'-c search_path='+schema,max:5});
+  await migrate(pool);await migrate(pool);
+  app=await createApp({pool,config:{...cfg,NODE_ENV:'test',registration:true,production:false,origin}});
+});
+after(async()=>{await pool?.end();if(admin){await admin.query(`DROP SCHEMA ${schema} CASCADE`);await admin.end();}});
+
+test('real registration, password hashing, session rotation, and logout invalidation',async()=>{
+  const agent=request.agent(app);const initial=await agent.get('/api/v1/auth/session').expect(200);
+  assert.equal(initial.body.user,null);assert.ok(initial.headers['set-cookie'][0].includes('HttpOnly'));
+  const email='auth-'+randomUUID()+'@example.test';
+  const created=await agent.post('/api/v1/auth/register').set('Origin',origin).set('X-CSRF-Token',initial.body.csrfToken).send({email,password,displayName:'Test patient',timezone:'Asia/Kolkata'}).expect(201);
+  assert.notEqual(initial.body.csrfToken,created.body.csrfToken);
+  const row=(await pool.query('SELECT password_hash FROM patients WHERE id=$1',[created.body.user.id])).rows[0];assert.ok(row.password_hash.startsWith('scrypt$'));assert.ok(!row.password_hash.includes(password));
+  await agent.post('/api/v1/auth/logout').set('Origin',origin).set('X-CSRF-Token',created.body.csrfToken).send({}).expect(204);
+  await agent.get('/api/v1/workspace').expect(401);
+  await request(app).get('/api/v1/workspace').set('Cookie',created.headers['set-cookie'][0].split(';')[0]).expect(401);
+  const anon=await agent.get('/api/v1/auth/session');
+  await agent.post('/api/v1/auth/login').set('Origin',origin).set('X-CSRF-Token',anon.body.csrfToken).send({email,password:'Incorrect'}).expect(401);
+  const signed=await agent.post('/api/v1/auth/login').set('Origin',origin).set('X-CSRF-Token',anon.body.csrfToken).send({email,password}).expect(200);
+  assert.equal(signed.body.user.id,created.body.user.id);
+  await agent.get('/api/v1/workspace').expect(200);
+});
+test('unauthenticated access, CSRF, and hostile origins cannot write schedules',async()=>{
+  await request(app).get('/api/v1/workspace').expect(401);
+  const a=await signup('CSRF');
+  await a.agent.post('/api/v1/medicines').send(med()).expect(403);
+  await a.agent.post('/api/v1/medicines').set('Origin','https://attacker.example').set('X-CSRF-Token',a.csrf).send(med()).expect(403);
+  const w=await a.agent.get('/api/v1/workspace').expect(200);assert.equal(w.body.medicines.length,0);assert.equal(w.body.device,null);
+});
+test('schedule changes are atomic and isolated per patient',async()=>{
+  const a=await signup('Patient A'),b=await signup('Patient B');
+  const created=await write(a,'post','/medicines',med()).expect(201),id=created.body.id;
+  await write(a,'post','/medicines',med({name:'Second prescription'})).expect(201);
+  await write(a,'post','/medicines',med({slotId:'afternoon',reminderTime:'08:10'})).expect(400);
+  let w=(await a.agent.get('/api/v1/workspace').expect(200)).body;
+  assert.equal(w.medicines.length,2);assert.equal(w.slots.find(s=>s.id==='afternoon').time,null);
+  await write(b,'patch','/medicines/'+id,{...med(),id}).expect(404);
+  await write(b,'delete','/medicines/'+id).expect(404);
+  assert.equal((await b.agent.get('/api/v1/workspace')).body.medicines.length,0);
+  await write(a,'patch','/medicines/'+id,{...med({reminderTime:'09:00'}),id}).expect(204);
+  w=(await a.agent.get('/api/v1/workspace')).body;assert.equal(w.slots[0].time,'09:00');
+  await write(a,'delete','/medicines/'+id).expect(204);
+  assert.equal((await a.agent.get('/api/v1/workspace')).body.medicines.length,1);
+});
+test('device pairing, stable reminder IDs, event retries, historical context, and token revocation',async()=>{
+  const a=await signup('Device patient'),b=await signup('Other patient');
+  const time=DateTime.now().setZone('Asia/Kolkata').toFormat('HH:mm');
+  const created=await write(a,'post','/medicines',med({reminderTime:time})).expect(201);
+  const d=(await write(a,'post','/devices',{label:'Test physical box'}).expect(201)).body;
+  assert.ok(d.deviceToken);const bearer='Bearer '+d.deviceToken;
+  const row=(await pool.query('SELECT token_hash FROM devices WHERE id=$1',[d.deviceId])).rows[0];assert.notEqual(row.token_hash,d.deviceToken);
+  const endpoint='/api/v1/devices/'+d.deviceId;
+  await request(app).get(endpoint+'/config').expect(401);
+  const config=(await request(app).get(endpoint+'/config').set('Authorization',bearer).expect(200)).body;assert.equal(config.calibrated,false);
+  await write(b,'patch','/devices/'+d.deviceId+'/config',{calibration:{closedBaselineCm:3,openThresholdCm:8,closeThresholdCm:3,stabilityMs:1000}}).expect(404);
+  await write(a,'patch','/devices/'+d.deviceId+'/config',{calibration:{closedBaselineCm:3,openThresholdCm:8,closeThresholdCm:3,stabilityMs:1000}}).expect(204);
+  const first=(await request(app).get(endpoint+'/reminders').set('Authorization',bearer).expect(200)).body;
+  const second=(await request(app).get(endpoint+'/reminders').set('Authorization',bearer).expect(200)).body;
+  assert.ok(first.reminders.length);assert.deepEqual(first.reminders.map(r=>r.id),second.reminders.map(r=>r.id));
+  await new Promise(r=>setTimeout(r,10));
+  const event={eventId:randomUUID(),deviceId:d.deviceId,type:'BOX_OPENED',occurredAt:new Date().toISOString(),sequence:1,timeQuality:'RTC_SYNCED',sensorType:'ULTRASONIC',distanceCm:14};
+  await write(a,'patch','/medicines/'+created.body.id,{...med({name:'Changed prescription',reminderTime:time}),id:created.body.id}).expect(204);
+  await request(app).post(endpoint+'/events').set('Authorization',bearer).send({events:[event]}).expect(200);
+  await request(app).post(endpoint+'/events').set('Authorization',bearer).send({events:[event]}).expect(200);
+  await request(app).post(endpoint+'/events').set('Authorization',bearer).send({events:[{...event,distanceCm:15}]}).expect(409);
+  await request(app).post(endpoint+'/events').set('Authorization',bearer).send({events:[{...event,eventId:randomUUID(),deviceId:randomUUID()}]}).expect(403);
+  const history=(await a.agent.get('/api/v1/workspace')).body;
+  assert.equal(history.events.length,1);assert.equal(history.events[0].reminderContext.medicines[0].name,'Test prescription');
+  assert.equal((await b.agent.get('/api/v1/workspace')).body.events.length,0);
+  await request(app).post(endpoint+'/heartbeat').set('Authorization',bearer).send({firmwareVersion:'test',appliedConfigVersion:2,appliedScheduleVersion:2,clockHealthy:true,queueDepth:0,lidState:'CLOSED',distanceCm:3,ledSlotId:null,buzzerActive:false,lastSequence:1,sensorHealthy:true}).expect(204);
+  assert.equal((await a.agent.get('/api/v1/workspace')).body.device.online,true);
+  const rotated=(await write(a,'post','/devices/'+d.deviceId+'/rotate-token',{}).expect(200)).body;
+  await request(app).get(endpoint+'/config').set('Authorization',bearer).expect(401);
+  await request(app).get(endpoint+'/config').set('Authorization','Bearer '+rotated.deviceToken).expect(200);
+  await write(a,'delete','/devices/'+d.deviceId).expect(204);
+  await request(app).get(endpoint+'/config').set('Authorization','Bearer '+rotated.deviceToken).expect(401);
+});
+test('registration validation and durable login throttling work',async()=>{
+  const a=request.agent(app),s=await a.get('/api/v1/auth/session');
+  await a.post('/api/v1/auth/register').set('Origin',origin).set('X-CSRF-Token',s.body.csrfToken).send({email:'invalid',password:'short',displayName:'No',timezone:'Invalid/Zone'}).expect(400);
+  const email='throttle-'+randomUUID()+'@example.test';
+  for(let i=0;i<15;i++)await a.post('/api/v1/auth/login').set('Origin',origin).set('X-CSRF-Token',s.body.csrfToken).send({email,password:'wrong'}).expect(401);
+  await a.post('/api/v1/auth/login').set('Origin',origin).set('X-CSRF-Token',s.body.csrfToken).send({email,password:'wrong'}).expect(429);
+});
+test('history pagination is complete and conflicted event batches roll back atomically',async()=>{
+  const a=await signup('History');const d=(await write(a,'post','/devices',{label:'History test box'}).expect(201)).body;
+  const auth='Bearer '+d.deviceToken,endpoint='/api/v1/devices/'+d.deviceId+'/events';
+  const base={deviceId:d.deviceId,type:'BOX_OPENED',occurredAt:new Date().toISOString(),timeQuality:'SYNCED',sensorType:'ULTRASONIC',distanceCm:14};
+  const events=Array.from({length:105},(_,i)=>({...base,eventId:randomUUID(),sequence:i}));
+  await request(app).post(endpoint).set('Authorization',auth).send({events:events.slice(0,100)}).expect(200);
+  await request(app).post(endpoint).set('Authorization',auth).send({events:events.slice(100)}).expect(200);
+  const first=(await a.agent.get('/api/v1/events').expect(200)).body;assert.equal(first.events.length,100);assert.ok(first.nextCursor);
+  const second=(await a.agent.get('/api/v1/events').query({cursor:first.nextCursor}).expect(200)).body;
+  assert.equal(second.events.length,5);assert.equal(second.nextCursor,null);assert.equal(new Set([...first.events,...second.events].map(e=>e.id)).size,105);
+  await request(app).post(endpoint).set('Authorization',auth).send({events:[{...base,eventId:randomUUID(),sequence:106},{...events[0],distanceCm:20}]}).expect(409);
+  assert.equal(Number((await pool.query('SELECT count(*) FROM box_events WHERE patient_id=$1',[a.user.id])).rows[0].count),105);
+});

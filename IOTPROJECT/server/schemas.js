@@ -1,0 +1,18 @@
+import {z} from 'zod';
+import {DateTime} from 'luxon';
+export const slotId=z.enum(['morning','afternoon','evening','night']);
+export const time=z.string().regex(/^([01]\d|2[0-3]):[0-5]\d$/);
+const text=max=>z.string().trim().min(1).max(max);
+export const timezone=z.string().trim().min(1).max(80).refine(v=>{try{new Intl.DateTimeFormat('en',{timeZone:v});return DateTime.now().setZone(v).isValid;}catch{return false;}},'Invalid timezone');
+export const email=z.email().max(254).transform(v=>v.trim().toLowerCase());
+export const password=z.string().min(12).max(128);
+export const login=z.object({email,password:z.string().min(1).max(128)}).strict();
+export const registration=z.object({email,password,displayName:text(80),timezone}).strict();
+export const medicine=z.object({id:z.uuid().optional(),name:text(80),strength:text(40),quantity:text(40),instructions:z.string().trim().max(200).default(''),slotId,reminderTime:time}).strict();
+export const slotsBody=z.object({slots:z.array(z.object({id:slotId,label:text(20),time:time.nullable()}).strict()).length(4)}).strict();
+export const calibration=z.object({closedBaselineCm:z.number().min(2).max(350),openThresholdCm:z.number().positive().max(300),closeThresholdCm:z.number().nonnegative().max(300),stabilityMs:z.number().int().min(100).max(10000)}).strict().refine(c=>c.openThresholdCm>c.closeThresholdCm&&c.closedBaselineCm+c.openThresholdCm<=400,'Invalid calibrated thresholds');
+export const deviceCreate=z.object({label:text(60),calibration:calibration.optional()}).strict();
+export const deviceUpdate=z.object({calibration}).strict();
+export const event=z.object({eventId:text(128),deviceId:z.uuid(),type:z.enum(['BOX_OPENED','BOX_CLOSED']),occurredAt:z.iso.datetime({offset:true}),sequence:z.number().int().min(0).max(Number.MAX_SAFE_INTEGER),timeQuality:z.enum(['RTC_SYNCED','NTP_SYNCED','SYNCED']),sensorType:z.literal('ULTRASONIC'),distanceCm:z.number().min(0).max(450).nullable()}).strict();
+export const eventsBody=z.object({events:z.array(event).min(1).max(100)}).strict();
+export const heartbeat=z.object({firmwareVersion:text(32),appliedConfigVersion:z.number().int().nonnegative(),appliedScheduleVersion:z.number().int().nonnegative(),clockHealthy:z.boolean(),queueDepth:z.number().int().min(0).max(10000),lidState:z.enum(['OPEN','CLOSED','UNKNOWN']),distanceCm:z.number().min(0).max(450).nullable(),ledSlotId:slotId.nullable(),buzzerActive:z.boolean(),lastSequence:z.number().int().nonnegative(),sensorHealthy:z.boolean()}).strict();

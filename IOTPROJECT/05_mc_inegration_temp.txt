@@ -1,0 +1,135 @@
+Your **ESP32 connects to the Express backend over Wi-Fi**. The backend saves readings in PostgreSQL, and the dashboard displays them.
+
+```text
+Ultrasonic sensor → ESP32 → Express API → PostgreSQL → Dashboard
+                       ↓
+                Four LEDs + buzzer
+```
+
+Follow this order:
+
+### 1. Finish running the application
+
+Make sure PostgreSQL, migrations, and `npm run dev` work. Create your patient account and add your medicines and reminder times.
+
+### 2. Connect the hardware
+
+Use the existing [hardware wiring guide](IOT-frontend/docs/03_HARDWARE_CONNECTIONS.md).
+
+The firmware currently targets a **classic ESP32-WROOM-32**:
+
+| Component | ESP32 connection |
+|---|---|
+| Ultrasonic TRIG | GPIO18, through the guide’s level buffer |
+| Ultrasonic ECHO | GPIO34, through the voltage divider |
+| Morning LED | GPIO13 |
+| Afternoon LED | GPIO14 |
+| Evening LED | GPIO26 |
+| Night LED | GPIO27 |
+| Buzzer | GPIO32, through a transistor driver |
+
+**Do not connect the ultrasonic sensor’s 5V ECHO directly to the ESP32.** Follow the guide for resistors, power, and shared ground.
+
+### 3. Register the box with your account
+
+With the app running, open another terminal in your project:
+
+```powershell
+npm run device:provision
+```
+
+Enter your patient email and password. It returns a **device ID and device token**. Save these privately; the token is shown once.
+
+### 4. Give the ESP32 a reachable backend address
+
+The supplied firmware requires **HTTPS with a valid certificate**.
+
+For laptop testing, expose your running Express server on **port 3001** using an HTTPS tunnel. For permanent use, deploy the backend to an HTTPS host.
+
+Your firmware address will look like:
+
+```text
+https://your-backend-host/api/v1
+```
+
+`localhost` on the ESP32 refers to the ESP32 itself, so it cannot use your laptop’s `localhost` address. The frontend’s port **5173** is not the device API endpoint.
+
+### 5. Configure the firmware
+
+Install **VS Code + the PlatformIO extension**, then open:
+
+```text
+firmware/SmartMed
+```
+
+Copy:
+
+```text
+include/secrets.example.h
+```
+
+to:
+
+```text
+include/secrets.h
+```
+
+Fill in:
+
+```cpp
+constexpr char WIFI_SSID[] = "YOUR_2_4_GHZ_WIFI";
+constexpr char WIFI_PASSWORD[] = "YOUR_WIFI_PASSWORD";
+
+constexpr char API_BASE_URL[] = "https://your-backend-host/api/v1";
+constexpr char DEVICE_ID[] = "YOUR_DEVICE_ID";
+constexpr char DEVICE_TOKEN[] = "YOUR_DEVICE_TOKEN";
+```
+
+Also insert the **PEM root CA certificate that validates your HTTPS host** into `TLS_ROOT_CA`. Keep this file private.
+
+### 6. Build and upload
+
+Connect the ESP32 by USB. From the PlatformIO terminal:
+
+```powershell
+pio run
+pio run -t upload
+pio run -t buildfs
+pio run -t uploadfs
+pio device monitor
+```
+
+Upload the filesystem only during initial setup: repeating `uploadfs` erases cached schedules and queued events.
+
+**The firmware is a starter:** cloud compilation was blocked by dependency downloads, and it has not been tested on a physical board yet. Compile it locally before relying on it.
+
+### 7. Calibrate your actual box
+
+Measure the ultrasonic distance with the lid closed and open. Create a private calibration JSON file containing measured numeric values for:
+
+- `closedBaselineCm`
+- `openThresholdCm` — increase above the closed distance
+- `closeThresholdCm` — a smaller increase threshold
+- `stabilityMs`
+
+Then apply it:
+
+```powershell
+npm run device:provision -- --device-id YOUR_DEVICE_ID --calibration calibration.json
+```
+
+The sensor must produce distinguishable, stable readings in both positions. A missing echo alone should not count as an opening.
+
+### 8. Test the complete flow
+
+Set a reminder a few minutes ahead:
+
+1. ESP32 downloads the schedule.
+2. The matching compartment LED blinks and the buzzer sounds.
+3. Opening the lid generates a box-opening event.
+4. ESP32 uploads it to Express.
+5. PostgreSQL stores it; dashboard History displays it.
+
+The record means **“box opened”**, not “correct medicine taken.”
+
+The full API and calibration instructions are in [Microcontroller integration](IOT-frontend/docs/02_MICROCONTROLLER_INTEGRATION.md).

@@ -1,0 +1,38 @@
+{
+  "name": "smartmed",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "concurrently --kill-others-on-fail -n api,web \"npm:dev:server\" \"npm:dev:web\"",
+    "build": "vite build",
+    "preview": "vite preview --host 0.0.0.0",
+    "test": "node --test tests/*.test.js",
+    "setup": "node scripts/setup.mjs",
+    "dev:web": "vite --host 0.0.0.0",
+    "dev:server": "node --watch server/index.js",
+    "start": "node server/index.js",
+    "db:migrate": "node server/migrate.js",
+    "test:server": "node --test server/tests/*.test.js",
+    "device:provision": "node scripts/device.mjs",
+    "account:reset": "node scripts/account.mjs"
+  },
+  "dependencies": {
+    "cookie-parser": "^1.4.7",
+    "dotenv": "^18.0.8",
+    "express": "^5.3.0",
+    "express-rate-limit": "^8.7.1",
+    "helmet": "^8.3.0",
+    "lucide-react": "^0.468.0",
+    "luxon": "^3.7.2",
+    "pg": "^8.23.1",
+    "react": "^19.1.0",
+    "react-dom": "^19.1.0",
+    "zod": "^4.6.7"
+  },
+  "devDependencies": {
+    "concurrently": "^10.0.6",
+    "supertest": "^7.3.1",
+    "vite": "^6.1.0"
+  }
+}
